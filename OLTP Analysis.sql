@@ -1,6 +1,9 @@
+-- ============================================================
 -- Monthly Encounters by Specialty
 -- For each month and specialty, show total encounters 
 -- and unique patients by encounter type
+-- ============================================================
+
 SELECT 
     DATE_FORMAT(e.encounter_date, '%Y-%m') AS encounter_month,
     s.specialty_name,
@@ -16,10 +19,11 @@ GROUP BY
     e.encounter_type
 ORDER BY encounter_month, specialty_name, encounter_type;
 
-
+-- ================================================================
 -- Top Diagnosis-Procedure Pairs
 -- Most common diagnosis-procedure combinations
 -- Show ICD code, procedure code, and encounter count
+-- ================================================================
 
 SELECT 
     d.icd10_code,
@@ -40,10 +44,11 @@ HAVING COUNT(DISTINCT ed.encounter_id) >= 1
 ORDER BY encounter_count DESC
 LIMIT 20;
 
-
+-- ==================================================================
 -- 30-Day Readmission Rate
 -- Which specialty has highest readmission rate?
 -- Definition: inpatient discharge, then return within 30 days
+-- ==================================================================
 
 WITH inpatient_discharges AS (
     SELECT 
@@ -83,8 +88,10 @@ GROUP BY s.specialty_name
 ORDER BY readmission_rate_pct DESC;
 
 
+-- ===========================================================
 -- Revenue by Specialty & Month
 -- Total allowed amounts by specialty and month
+-- ===========================================================
 
 SELECT 
     DATE_FORMAT(b.claim_date, '%Y-%m') AS billing_month,
