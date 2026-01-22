@@ -1,0 +1,321 @@
+PART 3: STAR SCHEMA DESIGN DECISIONS
+
+---
+
+DECISION 1: Fact Table Grain
+
+CHOICE: Option A - One row per encounter
+
+Rationale:
+
+I'm selecting one row per encounter as the fact table grain because:
+
+1.Matches business process: Healthcare analytics centers on encounters as the atomic unit of care delivery. Patients have encounters; encounters generate diagnoses, procedures, and billing.
+
+2.Supports all 4 queries efficiently:
+   - Q1 (Monthly encounters by specialty): Direct COUNT on fact table
+   - Q2 (Diagnosis-procedure pairs): Bridge tables handle many-to-many without exploding fact
+   - Q3 (Readmissions): Self-join still needed but on smaller, indexed fact table
+   - Q4 (Revenue by specialty): Pre-aggregated billing metrics in fact table
+
+3. Avoids row explosion: Option B or C would create multiple fact rows per encounter:
+   - Option B: Encounter with 3 diagnoses = 3 fact rows
+   - Option C: Encounter with 2 procedures = 2 fact rows
+   - Our Option A: 1 fact row + bridge tables for many-to-many
+
+4. Simplifies aggregation: Most KPIs measure encounters (admission rate, ER visits, readmissions). With encounter-grain, these are simple COUNT(*). With diagnosis-grain, we'd need COUNT(DISTINCT encounter_key) everywhere.
+
+5. Dimensional best practice: Kimball methodology recommends grain = business process event. The encounter IS the process; diagnoses and procedures are descriptive attributes.
+
+What we give up: Direct analysis of individual diagnoses/procedures requires bridge table joins. But this is cheaper than bloating fact table.
+
+---
+
+DECISION 2: Dimension Tables
+
+* dim_date
+Purpose: Time-series analysis, calendar patterns, fiscal reporting
+
+Attributes:
+- `date_key` (PK, INT, format: YYYYMMDD)
+- `full_date` (DATE, actual calendar date)
+- `year` (INT)
+- `quarter` (INT, 1-4)
+- `month` (INT, 1-12)
+- `month_name` (VARCHAR(20), 'January', 'February', etc.)
+- `week_of_year` (INT, 1-53)
+- `day_of_month` (INT, 1-31)
+- `day_name` (VARCHAR(20), 'Monday', 'Tuesday', etc.)
+- `is_weekend` (BOOLEAN)
+
+Why these attributes: Pre-computed time attributes eliminate DATE_FORMAT() calculations and enable fast filtering on any calendar dimension. Note: This design omits fiscal year attributes - they can be added if healthcare organization uses fiscal calendar different from calendar year.
+
+---
+
+* dim_patient
+Purpose: Patient demographics for cohort analysis
+
+Attributes:
+- `patient_key` (PK, INT AUTO_INCREMENT, surrogate)
+- `patient_id` (INT, business key from OLTP)
+- `first_name` (VARCHAR(100))
+- `last_name` (VARCHAR(100))
+- `gender` (CHAR(1), 'M', 'F')
+- `date_of_birth` (DATE)
+- `current_age` (INT, computed at ETL time)
+- `age_group` (VARCHAR(20), '0-18', '19-65', '65+')
+- `mrn` (VARCHAR(20), medical record number)
+
+Why these attributes: 
+- Age and age_group pre-computed (avoid calculation at query time)
+- Simplified SCD approach: Uses current_age which updates with each ETL run
+- Note: This design uses SCD Type 1 (overwrite) for age rather than Type 2 (versioning)
+- Trade-off: Cannot track historical age at time of encounter, but simpler to maintain
+
+---
+
+* dim_provider
+Purpose: Provider attribution and performance analysis
+
+Attributes:
+- `provider_key` (PK, INT AUTO_INCREMENT, surrogate)
+- `provider_id` (INT, business key from OLTP)
+- `full_name` (VARCHAR(200), denormalized combination of first + last)
+- `credential` (VARCHAR(20), 'MD', 'DO', 'NP', 'PA')
+- `npi` (VARCHAR(20), National Provider Identifier for compliance)
+
+Why these attributes: 
+- Simplified structure compared to original design - keeps provider separate from specialty
+- Full_name denormalized for reporting convenience
+- NPI field added for regulatory compliance and provider identification
+- Note: This design keeps specialty as a separate FK in the fact table rather than denormalizing into provider
+- Trade-off: Requires one additional join to specialty dimension, but maintains cleaner separation of concerns
+
+---
+
+* dim_specialty
+Purpose: Specialty reference for filtering and grouping
+
+Attributes:
+- `specialty_key` (PK, INT, surrogate)
+- `specialty_id` (INT, business key)
+- `specialty_name` (VARCHAR(100))
+- `specialty_code` (VARCHAR(10))
+- `specialty_category` (VARCHAR(50), 'Surgical', 'Medical', 'Emergency')
+
+Why include this: Even though specialty is denormalized into dim_provider, we keep a separate dimension for:
+- Master data management (single source of truth)
+- Specialty-level analysis independent of providers
+- Filtering UI needs complete specialty list
+
+---
+
+* dim_department
+Purpose: Department/location analysis
+
+Attributes:
+- `department_key` (PK, INT, surrogate)
+- `department_id` (INT, business key)
+- `department_name` (VARCHAR(100))
+- `floor` (INT)
+- `capacity` (INT)
+- `department_type` (VARCHAR(50), 'Inpatient', 'Outpatient', 'Emergency')
+
+---
+
+* dim_encounter_type
+Purpose: Encounter classification (Outpatient, Inpatient, ER)
+
+Attributes:
+- `encounter_type_key` (PK, INT AUTO_INCREMENT, surrogate)
+- `encounter_type_name` (VARCHAR(50), 'Outpatient', 'Inpatient', 'Emergency')
+- `encounter_type_description` (VARCHAR(200), additional context/definition)
+
+Why separate dimension: Provides controlled vocabulary, enables adding descriptive attributes without modifying fact table. This is a small reference dimension (3-5 rows typically).
+
+Note: This simplified design omits is_inpatient boolean flag - filtering can be done on encounter_type_name directly.
+
+---
+
+* dim_diagnosis (Reference dimension)
+Purpose: ICD-10 code reference for bridge table
+
+Attributes:
+- `diagnosis_key` (PK, INT AUTO_INCREMENT, surrogate)
+- `diagnosis_id` (INT, business key from OLTP)
+- `icd10_code` (VARCHAR(10))
+- `icd10_description` (VARCHAR(200))
+
+Note: This simplified design omits diagnosis_category and is_chronic flags. These can be added later if needed for specific analyses.
+
+---
+
+* dim_procedure(Reference dimension)
+Purpose: CPT code reference for bridge table
+
+Attributes:
+- `procedure_key` (PK, INT AUTO_INCREMENT, surrogate)
+- `procedure_id` (INT, business key from OLTP)
+- `cpt_code` (VARCHAR(10))
+- `cpt_description` (VARCHAR(200))
+
+Note: This simplified design omits procedure_category and rvu fields. These can be added through dimension enhancement if procedural cost analysis is required.
+
+---
+
+DECISION 3: Pre-Aggregated Metrics in Fact Table
+
+Metrics to store in fact_encounters**:
+
+Core Metrics:
+
+1. `is_readmission` (BOOLEAN DEFAULT 0)
+   - Flag indicating if this encounter is a readmission within 30 days
+   - Eliminates expensive self-join for readmission analysis
+   - Query 3 benefit: Simple WHERE clause filter instead of complex CTE
+
+2. `total_claim_amount` (DECIMAL(12,2))
+   - Pre-aggregated from billing table
+   - Sum of all billing claims for this encounter
+   - Query 4 benefit: Revenue analysis without billing table join
+
+3. `total_allowed_amount` (DECIMAL(12,2))
+   - Sum of allowed amounts across all billing records
+   - PRIMARY financial metric for revenue analysis
+   - Query 4 benefit: Direct SUM on fact table
+
+4. `length_of_stay_days` (INT)
+   - Computed from encounter_date and discharge_date
+   - Key metric for inpatient analysis
+   - Eliminates DATEDIFF calculation in queries
+
+5. `diagnosis_count` (INT)
+   - Count of diagnoses for this encounter
+   - Eliminates COUNT from bridge table join
+   - Query 2 benefit: Quick filter for multi-diagnosis encounters
+
+6. `procedure_count` (INT)
+   - Count of procedures for this encounter
+   - Enables instant "encounters with procedures" filtering
+   - Query 2 benefit: Avoids bridge table for simple counts
+
+Justification:
+
+Why pre-aggregate these metrics?
+
+1. Eliminates expensive joins: total_allowed_amount removes need to join billing table for 95% of financial queries
+
+2. Removes runtime calculations: length_of_stay computed once at ETL, not per query
+
+3. Enables fast filtering: Boolean flags and counts allow WHERE clause filters without joining bridge tables
+
+4. Supports common aggregations: Most dashboards show encounter counts, average LOS, total revenue - all now simple SUM/AVG on fact table
+
+5. Minimal storage cost: ~40 bytes of extra metrics per encounter row is negligible vs. query performance gain
+
+Trade-off: ETL must maintain these during loads. If a diagnosis is added to an encounter, diagnosis_count must be updated. This is acceptable because:
+- Analytical workload benefits 100+ users
+- ETL complexity impacts 1 pipeline
+- Most healthcare data is append-only (encounters don't change after closure)
+
+Note on is_readmission: This is calculated during ETL by looking back 30 days from each inpatient admission to check for previous inpatient discharge of same patient. This transforms the expensive self-join in Query 3 into a simple boolean filter.
+
+---
+
+DECISION 4: Bridge Tables for Many-to-Many
+
+DECISION: YES - Use bridge tables for diagnoses and procedures
+
+Bridge Table 1: bridge_encounter_diagnoses
+
+Attributes:
+- `bridge_diagnosis_key` (PK, INT AUTO_INCREMENT)
+- `encounter_key` (FK to fact_encounters)
+- `diagnosis_key` (FK to dim_diagnoses)
+- `diagnosis_sequence` (INT, primary vs. secondary diagnosis)
+
+Note: Uses a surrogate primary key rather than composite key for simplicity.
+
+Bridge Table 2: bridge_encounter_procedures
+
+Attributes:
+- `bridge_procedure_key` (PK, INT AUTO_INCREMENT)
+- `encounter_key` (FK to fact_encounters)
+- `procedure_key` (FK to dim_procedures)
+- `procedure_date` (DATE, when procedure performed)
+
+Note: Uses a surrogate primary key rather than composite key for simplicity.
+
+---
+
+Why Use Bridge Tables? (Instead of denormalizing into fact)
+
+Option A: Denormalize (all diagnoses as columns in fact table)
+```
+fact_encounters:
+  encounter_key
+  diagnosis_1_key
+  diagnosis_2_key
+  diagnosis_3_key
+  ...
+  diagnosis_10_key
+```
+
+Problems with Option A:
+- Wastes space: Most encounters have 1-3 diagnoses, but we'd reserve 10+ columns
+- Fixed limit: What if encounter has 15 diagnoses?
+- Sparse data: 70% of diagnosis columns would be NULL
+- Query complexity: Query 2 would need `WHERE diagnosis_1_key IN (...) OR diagnosis_2_key IN (...) OR ...`
+- Maintenance nightmare: Adding diagnosis means ALTER TABLE on billions of rows
+
+Option B: Bridge Tables (our choice)
+
+Benefits:
+1. Flexibility: Unlimited diagnoses/procedures per encounter
+2. Storage efficiency: Only store actual relationships, no NULLs
+3. Query simplicity: Standard JOIN pattern for many-to-many
+4. Schema stability: Adding diagnoses never requires schema changes
+
+Trade-offs:
+- Extra join required for diagnosis/procedure analysis
+- Bridge tables grow large (3-5x fact table size)
+
+Mitigation strategies:
+- Pre-aggregated counts in fact table (diagnosis_count) handle most queries without bridge join
+- Indexed properly, bridge joins are fast (both FKs indexed)
+- Only complex analysis (Query 2: diagnosis-procedure pairs) needs bridge tables
+
+When to denormalize instead?
+
+I would consider denormalizing if:
+- Maximum cardinality is small and fixed (e.g., max 3 diagnoses ALWAYS)
+- Analysis ALWAYS requires diagnosis data (then cost of join paid on every query)
+- Storage is more expensive than compute (rare in modern analytics)
+
+For our healthcare scenario: Bridge tables are correct choice.
+
+---
+
+DECISION SUMMARY
+
+| Design Element | Choice | Primary Benefit | Difference from Full Design |
+|---|---|---|---|
+| Fact grain | One row per encounter | Matches business process, avoids explosion | Same |
+| Dimension count | 8 dimensions | Complete context without over-granularity | Same |
+| Denormalization | Minimal - specialty kept separate | Maintains clean separation | **Different**: Original design denormalized specialty into provider |
+| Pre-aggregation | 6 metrics in fact | Removes 80% of bridge/billing table joins | **Different**: Fewer metrics, includes is_readmission flag |
+| Bridge tables | Yes, for Dx and Proc | Flexibility + storage efficiency | Same approach, different PK strategy |
+| Date dimension | Standard calendar attributes | Eliminates all DATE functions in queries | **Different**: Omits fiscal year attributes |
+| SCD Strategy | Type 1 for patient age | Simplicity over historical versioning | **Different**: Original used Type 2 |
+
+Expected performance improvement: 10-15x faster queries  based on:
+- Moderate denormalization (specialty separate requires extra join but cleaner)
+- Pre-aggregated billing and counts (Query 4: 3 joins → 2 joins)
+- is_readmission flag (Query 3: eliminates self-join completely)
+- Pre-computed dates (Query 1 & 4: No DATE_FORMAT)
+- Indexed bridge tables (Query 2: Optimized many-to-many)
+
+Key Architectural Differences:
+1. Less aggressive denormalization: Specialty kept as separate FK in fact table rather than embedded in provider dimension. This maintains cleaner separation but requires one additional join for specialty analysis.
+2. is_readmission as pre-computed flag: Rather than calculating readmissions at query time with self-join, this is computed during ETL and stored as boolean. This is a major optimization for Query 3.
+3. Simpler dimension design: Omits SCD Type 2 versioning, fiscal year attributes, and extended metadata. Focus is on core analytics rather than comprehensive historical tracking.

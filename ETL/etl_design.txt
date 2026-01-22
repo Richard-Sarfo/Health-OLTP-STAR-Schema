@@ -1,0 +1,714 @@
+================================================================================
+ETL DESIGN DOCUMENT: Healthcare OLTP to OLAP Data Warehouse Pipeline
+================================================================================
+Version: 1.0
+Author: Data Engineering Team
+Last Updated: January 2026
+Pipeline Type: Full Refresh ETL with Dimensional Modeling
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+Purpose:
+    Transform operational healthcare data (OLTP) into an analytical data 
+    warehouse (OLAP) optimized for reporting, business intelligence, and 
+    clinical analytics.
+
+Architecture Pattern:
+    - Star Schema with Bridge Tables
+    - Full Refresh Strategy (Truncate & Load)
+    - Procedural ETL with Transactional Integrity
+    - Built-in Logging and Error Handling
+
+Source System: healthtech_oltp (Operational Database)
+Target System: healthtech_olap (Analytical Data Warehouse)
+
+Key Performance Indicators:
+    - Patient demographics and segmentation
+    - Provider performance metrics
+    - Department utilization
+    - Readmission rates (30-day window)
+    - Billing and revenue analytics
+    - Clinical procedure and diagnosis patterns
+
+================================================================================
+2. ETL ARCHITECTURE & DESIGN PATTERNS
+================================================================================
+
+2.1 ETL METHODOLOGY
+------------------
+Type: ELT Hybrid (Extract-Load-Transform)
+    - Extract: Direct SQL queries from source tables
+    - Load: Batch insertion into staging/dimension tables
+    - Transform: SQL-based transformations during load
+
+Refresh Strategy: Full Refresh
+    - All target tables truncated before each run
+    - Complete dataset reloaded from source
+    - Suitable for moderate data volumes (<10M records)
+    - Ensures data consistency without complex change detection
+
+Transaction Management:
+    - Each dimension load wrapped in transaction
+    - Automatic rollback on failure
+    - Fact table loads use staging table for optimization
+
+2.2 DIMENSIONAL MODEL STRUCTURE
+--------------------------------
+Schema Type: Star Schema with Conformed Dimensions
+
+Fact Table:
+    - fact_encounters (Grain: One row per patient encounter)
+    
+Dimensions:
+    - dim_patient (Patient demographics with derived attributes)
+    - dim_provider (Healthcare provider information)
+    - dim_department (Hospital departments)
+    - dim_specialty (Medical specialties)
+    - dim_encounter_type (Type of medical visit)
+    - dim_date (Time intelligence for temporal analysis)
+    - dim_diagnoses (ICD-10 diagnosis codes)
+    - dim_procedures (CPT procedure codes)
+
+Bridge Tables (Many-to-Many Relationships):
+    - bridge_encounter_diagnoses (Encounter ↔ Multiple Diagnoses)
+    - bridge_encounter_procedures (Encounter ↔ Multiple Procedures)
+
+2.3 KEY DESIGN DECISIONS
+-------------------------
+Decision 1: Surrogate Keys
+    - All dimensions use auto-incrementing surrogate keys
+    - Fact table references surrogate keys, not natural keys
+    - Benefits: Performance, flexibility, historical tracking support
+
+Decision 2: Pre-Aggregated Metrics in Fact Table
+    - diagnosis_count, procedure_count computed during load
+    - total_claim_amount, total_allowed_amount pre-summed
+    - Rationale: Avoids expensive joins during query time
+
+Decision 3: Derived Attributes
+    - Patient age and age_group calculated at load time
+    - Length of stay computed from encounter/discharge dates
+    - Readmission flag calculated with 30-day lookback window
+
+Decision 4: Bridge Tables for Many-to-Many
+    - Encounters have multiple diagnoses and procedures
+    - Bridge tables preserve granularity without fact table bloat
+    - Supports drill-through queries on specific diagnoses/procedures
+
+================================================================================
+3. ETL WORKFLOW - STEP-BY-STEP PSEUDOCODE
+================================================================================
+
+PHASE 0: INITIALIZATION
+-----------------------
+BEGIN ETL_PIPELINE
+
+    STEP 0.1: Database Setup
+        IF database "healthtech_olap" does NOT exist THEN
+            CREATE database "healthtech_olap"
+        END IF
+        USE database "healthtech_olap"
+    
+    STEP 0.2: ETL Control Table Setup
+        IF table "etl_control" does NOT exist THEN
+            CREATE table "etl_control" with columns:
+                - etl_run_id (auto-increment primary key)
+                - run_start_datetime
+                - run_end_datetime
+                - status (RUNNING, SUCCESS, FAILED)
+                - records_processed
+                - error_message
+                - etl_phase (tracking current step)
+        END IF
+    
+    STEP 0.3: Start ETL Run Logging
+        INSERT new row into etl_control:
+            run_start_datetime = CURRENT_TIMESTAMP
+            status = 'RUNNING'
+            etl_phase = 'INITIALIZATION'
+        
+        CAPTURE etl_run_id = last_inserted_id
+        SET batch_size = 10000
+        
+        LOG: "ETL Run #{etl_run_id} started at {timestamp}"
+
+PHASE 1: PRE-ETL VALIDATION & CLEANUP
+--------------------------------------
+    STEP 1.1: Truncate All Target Tables (Full Refresh)
+        TRUNCATE bridge_encounter_procedures
+        TRUNCATE bridge_encounter_diagnoses
+        TRUNCATE fact_encounters
+        TRUNCATE dim_date
+        TRUNCATE dim_encounter_type
+        TRUNCATE dim_procedures
+        TRUNCATE dim_diagnoses
+        TRUNCATE dim_patient
+        TRUNCATE dim_provider
+        TRUNCATE dim_department
+        TRUNCATE dim_specialty
+        
+        LOG: "All target tables truncated"
+    
+    STEP 1.2: Update ETL Phase
+        UPDATE etl_control
+        SET etl_phase = 'CLEANUP_COMPLETE'
+        WHERE etl_run_id = current_run_id
+
+PHASE 2: DIMENSION TABLE LOADING
+---------------------------------
+    /* Load Order: Independent dimensions first, then dependent ones */
+    
+    STEP 2.1: Load dim_specialty
+        BEGIN TRANSACTION
+            INSERT INTO dim_specialty (specialty_id, specialty_name, specialty_code)
+            SELECT specialty_id, specialty_name, specialty_code
+            FROM oltp.specialties
+            
+            CAPTURE rows_affected = row_count()
+        COMMIT TRANSACTION
+        
+        UPDATE etl_control
+        SET etl_phase = 'DIM_SPECIALTY_LOADED',
+            records_processed = rows_affected
+        WHERE etl_run_id = current_run_id
+    
+    STEP 2.2: Load dim_department
+        BEGIN TRANSACTION
+            INSERT INTO dim_department (department_id, department_name, floor, capacity)
+            SELECT department_id, department_name, floor, capacity
+            FROM oltp.departments
+        COMMIT TRANSACTION
+        
+        LOG: "Departments loaded"
+    
+    STEP 2.3: Load dim_provider (WITH TRANSFORMATIONS)
+        BEGIN TRANSACTION
+            INSERT INTO dim_provider (provider_id, full_name, credential)
+            SELECT 
+                provider_id,
+                CONCATENATE(first_name, ' ', last_name) AS full_name,
+                IF credential IS NULL THEN 'UNKNOWN' ELSE UPPERCASE(credential)
+            FROM oltp.providers
+        COMMIT TRANSACTION
+        
+        TRANSFORMATIONS APPLIED:
+            - full_name: Combined first and last name with space
+            - credential: Standardized to uppercase, default 'UNKNOWN'
+        
+        LOG: "Providers loaded with name concatenation"
+    
+    STEP 2.4: Load dim_patient (WITH ENRICHMENT)
+        BEGIN TRANSACTION
+            INSERT INTO dim_patient (
+                patient_id, first_name, last_name, gender, 
+                date_of_birth, mrn, current_age, age_group
+            )
+            SELECT 
+                patient_id,
+                first_name,
+                last_name,
+                UPPERCASE(gender),
+                date_of_birth,
+                mrn,
+                CALCULATE_AGE(date_of_birth, CURRENT_DATE) AS current_age,
+                CASE 
+                    WHEN age < 18 THEN '0-18'
+                    WHEN age BETWEEN 19 AND 65 THEN '19-65'
+                    WHEN age > 65 THEN '65+'
+                END AS age_group
+            FROM oltp.patients
+            WHERE date_of_birth IS NOT NULL
+        COMMIT TRANSACTION
+        
+        BUSINESS RULES:
+            - Filter out patients with missing birthdate
+            - Standardize gender to uppercase
+            - Calculate current age dynamically
+            - Categorize into three age groups for segmentation
+        
+        LOG: "Patients loaded with age calculations"
+    
+    STEP 2.5: Load dim_diagnoses
+        BEGIN TRANSACTION
+            INSERT INTO dim_diagnoses (diagnosis_id, icd10_code, icd10_description)
+            SELECT diagnosis_id, icd10_code, icd10_description
+            FROM oltp.diagnoses
+        COMMIT TRANSACTION
+        
+        LOG: "Diagnoses dimension loaded"
+    
+    STEP 2.6: Load dim_procedures
+        BEGIN TRANSACTION
+            INSERT INTO dim_procedures (procedure_id, cpt_code, cpt_description)
+            SELECT procedure_id, cpt_code, cpt_description
+            FROM oltp.procedures
+        COMMIT TRANSACTION
+        
+        LOG: "Procedures dimension loaded"
+    
+    STEP 2.7: Load dim_encounter_type (DISTINCT VALUES)
+        BEGIN TRANSACTION
+            INSERT INTO dim_encounter_type (encounter_type_name)
+            SELECT DISTINCT UPPERCASE(TRIM(encounter_type))
+            FROM oltp.encounters
+            WHERE encounter_type IS NOT NULL
+        COMMIT TRANSACTION
+        
+        TRANSFORMATIONS:
+            - Extract unique encounter types only
+            - Standardize with uppercase and trim whitespace
+            - Filter out NULL values
+        
+        LOG: "Encounter types loaded (distinct values)"
+    
+    STEP 2.8: Load dim_date (DATE INTELLIGENCE)
+        BEGIN TRANSACTION
+            INSERT INTO dim_date (
+                date_key, full_date, year, quarter, month, month_name,
+                week_of_year, day_of_month, day_name, is_weekend
+            )
+            SELECT DISTINCT
+                FORMAT(encounter_date as 'YYYYMMDD') AS date_key,
+                encounter_date AS full_date,
+                EXTRACT_YEAR(encounter_date),
+                EXTRACT_QUARTER(encounter_date),
+                EXTRACT_MONTH(encounter_date),
+                MONTH_NAME(encounter_date),
+                WEEK_NUMBER(encounter_date),
+                DAY_OF_MONTH(encounter_date),
+                DAY_NAME(encounter_date),
+                IF day_of_week IN (Saturday, Sunday) THEN 1 ELSE 0
+            FROM oltp.encounters
+            WHERE encounter_date IS NOT NULL
+        COMMIT TRANSACTION
+        
+        DATE ATTRIBUTES CREATED:
+            - date_key: Integer format (YYYYMMDD) for efficient joins
+            - Time hierarchies: Year → Quarter → Month → Week → Day
+            - is_weekend flag for business vs. weekend analysis
+        
+        LOG: "Date dimension loaded with time intelligence"
+    
+    STEP 2.9: Finalize Dimension Loading Phase
+        UPDATE etl_control
+        SET etl_phase = 'ALL_DIMENSIONS_LOADED'
+        WHERE etl_run_id = current_run_id
+
+PHASE 3: FACT TABLE LOADING (STAGED APPROACH)
+----------------------------------------------
+    STEP 3.1: Create Staging Table with Pre-Aggregation
+        DROP TEMPORARY TABLE IF EXISTS stg_encounter_metrics
+        
+        CREATE TEMPORARY TABLE stg_encounter_metrics AS
+        SELECT 
+            e.encounter_id,
+            e.patient_id,
+            e.provider_id,
+            e.department_id,
+            e.encounter_type,
+            e.encounter_date,
+            e.discharge_date,
+            p.specialty_id,
+            COUNT(DISTINCT ed.diagnosis_id) AS diagnosis_count,
+            COUNT(DISTINCT ep.procedure_id) AS procedure_count,
+            SUM(b.claim_amount) AS total_claim_amount,
+            SUM(b.allowed_amount) AS total_allowed_amount
+        FROM oltp.encounters e
+        INNER JOIN oltp.providers p ON e.provider_id = p.provider_id
+        LEFT JOIN oltp.encounter_diagnoses ed ON e.encounter_id = ed.encounter_id
+        LEFT JOIN oltp.encounter_procedures ep ON e.encounter_id = ep.encounter_id
+        LEFT JOIN oltp.billing b ON e.encounter_id = b.encounter_id
+        WHERE e.encounter_date IS NOT NULL
+        GROUP BY e.encounter_id, e.patient_id, e.provider_id, 
+                 e.department_id, e.encounter_type, e.encounter_date,
+                 e.discharge_date, p.specialty_id
+        
+        CREATE INDEX ON stg_encounter_metrics(patient_id)
+        CREATE INDEX ON stg_encounter_metrics(encounter_id)
+        
+        RATIONALE:
+            - Pre-aggregate metrics to avoid repeated calculations
+            - Staging table enables quality checks before fact load
+            - Indexes improve join performance in next step
+        
+        UPDATE etl_control
+        SET etl_phase = 'STAGING_TABLE_CREATED'
+        WHERE etl_run_id = current_run_id
+    
+    STEP 3.2: Load Fact Table with Surrogate Key Lookups
+        BEGIN TRANSACTION
+            INSERT INTO fact_encounters (
+                encounter_id, date_key, patient_key, provider_key,
+                specialty_key, department_key, encounter_type_key,
+                is_readmission, total_claim_amount, total_allowed_amount,
+                length_of_stay_days, diagnosis_count, procedure_count
+            )
+            SELECT 
+                stg.encounter_id,
+                FORMAT(stg.encounter_date as 'YYYYMMDD') AS date_key,
+                
+                /* Surrogate Key Lookups via INNER JOIN */
+                dp.patient_key,
+                dpr.provider_key,
+                ds.specialty_key,
+                dd.department_key,
+                det.encounter_type_key,
+                
+                /* Initial readmission flag (updated later) */
+                0 AS is_readmission,
+                
+                /* Aggregated metrics from staging */
+                COALESCE(stg.total_claim_amount, 0),
+                COALESCE(stg.total_allowed_amount, 0),
+                
+                /* Calculated metric */
+                DATE_DIFFERENCE(
+                    COALESCE(stg.discharge_date, stg.encounter_date),
+                    stg.encounter_date
+                ) AS length_of_stay_days,
+                
+                COALESCE(stg.diagnosis_count, 0),
+                COALESCE(stg.procedure_count, 0)
+                
+            FROM stg_encounter_metrics stg
+            INNER JOIN dim_patient dp ON stg.patient_id = dp.patient_id
+            INNER JOIN dim_provider dpr ON stg.provider_id = dpr.provider_id
+            INNER JOIN dim_specialty ds ON stg.specialty_id = ds.specialty_id
+            INNER JOIN dim_department dd ON stg.department_id = dd.department_id
+            INNER JOIN dim_encounter_type det 
+                ON UPPERCASE(TRIM(stg.encounter_type)) = det.encounter_type_name
+            
+            LIMIT 1000  /* Safety limit for initial load */
+            
+            CAPTURE fact_rows = row_count()
+        COMMIT TRANSACTION
+        
+        KEY TRANSFORMATIONS:
+            - Surrogate key lookups ensure referential integrity
+            - COALESCE handles NULL values for metrics
+            - Length of stay: If discharge_date is NULL, assume same-day
+            - INNER JOINs enforce dimension existence (orphan rejection)
+        
+        UPDATE etl_control
+        SET etl_phase = 'FACT_TABLE_LOADED',
+            records_processed = fact_rows
+        WHERE etl_run_id = current_run_id
+    
+    STEP 3.3: Calculate Readmission Flags (COMPLEX BUSINESS LOGIC)
+        DISABLE safe update mode temporarily
+        
+        UPDATE fact_encounters f
+        INNER JOIN (
+            /* Subquery to identify readmissions */
+            SELECT 
+                e1.encounter_id,
+                CASE 
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM oltp.encounters e2
+                        WHERE e2.patient_id = e1.patient_id
+                          AND e2.encounter_type = 'Inpatient'
+                          AND e2.encounter_date < e1.encounter_date
+                          AND e2.encounter_date >= (e1.encounter_date - 30 DAYS)
+                    ) THEN 1
+                    ELSE 0
+                END AS readmit_flag
+            FROM oltp.encounters e1
+        ) readmit_calc ON f.encounter_id = readmit_calc.encounter_id
+        SET f.is_readmission = readmit_calc.readmit_flag
+        
+        ENABLE safe update mode
+        
+        BUSINESS RULE: 30-Day Readmission
+            An encounter is flagged as a readmission IF:
+                1. Patient had prior inpatient encounter
+                2. Prior encounter occurred within last 30 days
+                3. Current encounter is being analyzed
+            
+            Clinical Significance:
+                - Key quality metric for hospitals
+                - Often tied to reimbursement penalties
+                - Indicates care coordination effectiveness
+        
+        LOG: "Readmission flags calculated (30-day window)"
+
+PHASE 4: BRIDGE TABLE LOADING (MANY-TO-MANY)
+---------------------------------------------
+    STEP 4.1: Load Diagnosis Bridge Table
+        BEGIN TRANSACTION
+            INSERT INTO bridge_encounter_diagnoses (
+                encounter_key, diagnosis_key, diagnosis_sequence
+            )
+            SELECT 
+                f.encounter_key,
+                d.diagnosis_key,
+                ed.diagnosis_sequence
+            FROM oltp.encounter_diagnoses ed
+            INNER JOIN fact_encounters f ON ed.encounter_id = f.encounter_id
+            INNER JOIN dim_diagnoses d ON ed.diagnosis_id = d.diagnosis_id
+        COMMIT TRANSACTION
+        
+        PURPOSE:
+            - Resolves many-to-many: One encounter has multiple diagnoses
+            - Preserves diagnosis sequence (primary, secondary, etc.)
+            - Enables drill-through from fact to individual diagnoses
+        
+        LOG: "Diagnosis bridge table loaded"
+    
+    STEP 4.2: Load Procedure Bridge Table
+        BEGIN TRANSACTION
+            INSERT INTO bridge_encounter_procedures (
+                encounter_key, procedure_key, procedure_date
+            )
+            SELECT 
+                f.encounter_key,
+                p.procedure_key,
+                ep.procedure_date
+            FROM oltp.encounter_procedures ep
+            INNER JOIN fact_encounters f ON ep.encounter_id = f.encounter_id
+            INNER JOIN dim_procedures p ON ep.procedure_id = p.procedure_id
+        COMMIT TRANSACTION
+        
+        PURPOSE:
+            - Resolves many-to-many: One encounter has multiple procedures
+            - Captures specific procedure date (may differ from encounter date)
+            - Supports procedure-level analysis and reporting
+        
+        LOG: "Procedure bridge table loaded"
+
+PHASE 5: ETL FINALIZATION & CLEANUP
+------------------------------------
+    STEP 5.1: Drop Staging Tables
+        DROP TEMPORARY TABLE IF EXISTS stg_encounter_metrics
+        
+        LOG: "Temporary staging tables cleaned up"
+    
+    STEP 5.2: Update ETL Control with Success Status
+        UPDATE etl_control
+        SET 
+            run_end_datetime = CURRENT_TIMESTAMP,
+            status = 'SUCCESS',
+            etl_phase = 'COMPLETED'
+        WHERE etl_run_id = current_run_id
+        
+        LOG: "ETL run marked as SUCCESS"
+    
+    STEP 5.3: Generate ETL Summary Report
+        SELECT 
+            etl_run_id,
+            run_start_datetime,
+            run_end_datetime,
+            CALCULATE_DURATION(run_start_datetime, run_end_datetime) AS duration_seconds,
+            status,
+            records_processed,
+            etl_phase
+        FROM etl_control
+        WHERE etl_run_id = current_run_id
+        
+        DISPLAY summary to execution log
+        
+        LOG: "ETL completed successfully in {duration_seconds} seconds"
+
+END ETL_PIPELINE
+
+================================================================================
+4. ERROR HANDLING & RECOVERY STRATEGY
+================================================================================
+
+Transaction Rollback:
+    - Each dimension load in separate transaction
+    - If any step fails, transaction automatically rolls back
+    - Database returns to consistent state before that step
+
+ETL Control Logging:
+    - Every major phase updates etl_control table
+    - On error, etl_phase field shows exactly where failure occurred
+    - error_message field can capture exception details
+
+Manual Recovery Process:
+    IF ETL fails mid-run THEN
+        1. Check etl_control for failure point (etl_phase)
+        2. Review error_message for root cause
+        3. Fix source data or SQL logic
+        4. Re-run entire ETL (full refresh handles partial loads)
+    END IF
+
+Safe Update Mode:
+    - Temporarily disabled for readmission calculation
+    - Prevents accidental mass updates
+    - Re-enabled immediately after update completes
+
+================================================================================
+5. DATA QUALITY & BUSINESS RULES
+================================================================================
+
+Rule 1: Mandatory Date of Birth
+    - Patients without date_of_birth excluded from dim_patient
+    - Rationale: Age calculations impossible without birthdate
+    - Impact: Ensures age_group segmentation is accurate
+
+Rule 2: Encounter Type Standardization
+    - All encounter types converted to uppercase
+    - Leading/trailing whitespace trimmed
+    - NULL values filtered out
+    - Purpose: Consistent categorization for reporting
+
+Rule 3: Credential Defaulting
+    - Provider credentials default to 'UNKNOWN' if NULL
+    - Prevents broken joins in queries
+    - Maintains referential integrity
+
+Rule 4: Zero-Coalescing for Metrics
+    - All financial and count metrics use COALESCE(value, 0)
+    - NULL treated as zero for aggregation purposes
+    - Prevents NULL propagation in calculations
+
+Rule 5: Same-Day Discharge Assumption
+    - If discharge_date is NULL, use encounter_date
+    - Results in length_of_stay = 0 days
+    - Represents outpatient or emergency visits
+
+Rule 6: Readmission Definition (Clinical Standard)
+    - 30-day lookback window
+    - Only inpatient encounters count as index admissions
+    - Patient-specific (readmission for same patient only)
+
+================================================================================
+6. PERFORMANCE OPTIMIZATION TECHNIQUES
+================================================================================
+
+Optimization 1: Staging Table with Pre-Aggregation
+    - Compute diagnosis_count and procedure_count once
+    - Avoids correlated subqueries in fact table INSERT
+    - Reduces query complexity from O(n²) to O(n)
+
+Optimization 2: Staging Table Indexes
+    - Indexes on patient_id and encounter_id
+    - Accelerates surrogate key lookups during fact load
+    - Critical for large-volume INNER JOINs
+
+Optimization 3: Batch Size Limiting
+    - LIMIT 1000 on fact_encounters initial load
+    - Prevents memory overflow on large datasets
+    - Can be increased or removed for production
+
+Optimization 4: Transactional Batching
+    - Each dimension loaded in single transaction
+    - Reduces transaction overhead vs. row-by-row inserts
+    - Enables faster commit times
+
+Optimization 5: Full Refresh vs. Incremental
+    - Full refresh used due to moderate data volume
+    - Simpler logic (no change detection needed)
+    - If scaling to 10M+ records, switch to incremental ETL
+
+================================================================================
+7. DIMENSIONAL MODEL USAGE EXAMPLES
+================================================================================
+
+Use Case 1: Patient Demographics Report
+    SELECT 
+        age_group,
+        gender,
+        COUNT(DISTINCT patient_key) AS patient_count
+    FROM dim_patient
+    GROUP BY age_group, gender
+    ORDER BY age_group, gender
+
+Use Case 2: Monthly Encounter Volume by Department
+    SELECT 
+        d.month_name,
+        d.year,
+        dept.department_name,
+        COUNT(f.encounter_key) AS encounter_volume
+    FROM fact_encounters f
+    JOIN dim_date d ON f.date_key = d.date_key
+    JOIN dim_department dept ON f.department_key = dept.department_key
+    GROUP BY d.month_name, d.year, dept.department_name
+
+Use Case 3: Readmission Rate Analysis
+    SELECT 
+        et.encounter_type_name,
+        SUM(f.is_readmission) AS readmissions,
+        COUNT(*) AS total_encounters,
+        (SUM(f.is_readmission) / COUNT(*)) * 100 AS readmission_rate_pct
+    FROM fact_encounters f
+    JOIN dim_encounter_type et ON f.encounter_type_key = et.encounter_type_key
+    GROUP BY et.encounter_type_name
+
+Use Case 4: Top 10 Diagnoses by Encounter Count
+    SELECT 
+        d.icd10_code,
+        d.icd10_description,
+        COUNT(DISTINCT b.encounter_key) AS encounter_count
+    FROM bridge_encounter_diagnoses b
+    JOIN dim_diagnoses d ON b.diagnosis_key = d.diagnosis_key
+    GROUP BY d.icd10_code, d.icd10_description
+    ORDER BY encounter_count DESC
+    LIMIT 10
+
+Use Case 5: Provider Performance Scorecard
+    SELECT 
+        p.full_name,
+        s.specialty_name,
+        COUNT(f.encounter_key) AS total_encounters,
+        AVG(f.length_of_stay_days) AS avg_los,
+        SUM(f.total_claim_amount) AS total_revenue
+    FROM fact_encounters f
+    JOIN dim_provider p ON f.provider_key = p.provider_key
+    JOIN dim_specialty s ON f.specialty_key = s.specialty_key
+    GROUP BY p.full_name, s.specialty_name
+    ORDER BY total_revenue DESC
+
+================================================================================
+8. MAINTENANCE & SCHEDULING RECOMMENDATIONS
+================================================================================
+
+ETL Schedule:
+    - Frequency: Daily (off-peak hours, e.g., 2:00 AM)
+    - Duration: ~5-15 minutes for moderate data volumes
+    - Trigger: Automated via scheduler (cron, Airflow, SQL Server Agent)
+
+Monitoring:
+    - Query etl_control table daily for status = 'SUCCESS'
+    - Alert on status = 'FAILED' or duration > 30 minutes
+    - Track records_processed trend for anomaly detection
+
+Data Retention:
+    - Keep etl_control history for 90 days
+    - Archive or purge old ETL run logs quarterly
+    - Maintain audit trail for compliance
+
+Scalability Considerations:
+    - If fact table exceeds 10M rows, implement partitioning
+    - Consider incremental ETL with CDC (Change Data Capture)
+    - Add data quality validation layer pre-load
+
+Testing Strategy:
+    - Unit test each dimension load independently
+    - Integration test full pipeline on sample dataset
+    - Validate output against known baseline metrics
+    - Perform data reconciliation (source vs. target counts)
+
+================================================================================
+9. GLOSSARY OF TERMS
+================================================================================
+
+OLTP: Online Transaction Processing (operational database)
+OLAP: Online Analytical Processing (data warehouse)
+ETL: Extract, Transform, Load
+Surrogate Key: Artificial key (auto-increment) vs. natural key
+Star Schema: Fact table surrounded by dimension tables
+Bridge Table: Resolves many-to-many relationships
+Grain: Level of detail in fact table (one row = one encounter)
+Dimension: Descriptive attributes for analysis (who, what, when, where)
+Fact: Measurable events or transactions (metrics, KPIs)
+ICD-10: International Classification of Diseases (diagnosis codes)
+CPT: Current Procedural Terminology (procedure codes)
+MRN: Medical Record Number (patient identifier)
+
+================================================================================
+END OF ETL DESIGN DOCUMENT
+================================================================================
